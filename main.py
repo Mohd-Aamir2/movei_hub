@@ -1,10 +1,12 @@
 import os
 import pickle
+import asyncio
 from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
 import httpx
+from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -28,7 +30,7 @@ if not TMDB_API_KEY:
 # =========================
 # FASTAPI APP
 # =========================
-app = FastAPI(title="Movie Recommender API", version="3.0")
+app = FastAPI(title="Movie Recommender API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +39,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =========================
+# TMDB RESPONSE CACHE
+# =========================
+# Shared across ALL routes (/home, /tmdb/search, /movie/id, /movie/search, /recommend/*)
+# 10-minute TTL — trending/popular/top-rated lists don't change minute-to-minute, so this
+# alone eliminates the vast majority of duplicate TMDB calls that were causing 429s.
+_tmdb_cache: TTLCache = TTLCache(maxsize=1000, ttl=600)
+_cache_lock = asyncio.Lock()
 
 
 # =========================
@@ -106,28 +118,61 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
 
 async def tmdb_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Safe TMDB GET:
+    Safe TMDB GET with:
+    - Shared TTL cache (10 min) across ALL routes -> massively cuts down duplicate calls
+    - Automatic retry-with-backoff on 429 (rate limited) responses
     - Network errors -> 502
     - TMDB API errors -> 502 with detail
     """
+    cache_key = (path, tuple(sorted(params.items())))
+
+    async with _cache_lock:
+        cached = _tmdb_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(f"{TMDB_BASE}{path}", params=q)
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
-        )
+    max_retries = 3
+    last_error_detail = None
 
-    if r.status_code != 200:
-        raise HTTPException(
-            status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
-        )
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.get(f"{TMDB_BASE}{path}", params=q)
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"TMDB request error: {type(e).__name__} | {repr(e)}",
+            )
 
-    return r.json()
+        if r.status_code == 429:
+            # TMDB rate-limited us — back off (respecting Retry-After if present) and retry
+            try:
+                retry_after = float(r.headers.get("Retry-After", 1))
+            except (TypeError, ValueError):
+                retry_after = 1.0
+            # exponential-ish backoff floor so we don't hammer TMDB immediately
+            wait_s = max(retry_after, 2 ** attempt)
+            last_error_detail = f"TMDB 429, retrying in {wait_s}s (attempt {attempt + 1}/{max_retries})"
+            await asyncio.sleep(wait_s)
+            continue
+
+        if r.status_code != 200:
+            raise HTTPException(
+                status_code=502, detail=f"TMDB error {r.status_code}: {r.text}"
+            )
+
+        data = r.json()
+        async with _cache_lock:
+            _tmdb_cache[cache_key] = data
+        return data
+
+    raise HTTPException(
+        status_code=502,
+        detail=f"TMDB rate limit exceeded after {max_retries} retries. {last_error_detail or ''}",
+    )
 
 
 async def tmdb_cards_from_results(
@@ -261,6 +306,8 @@ async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
     """
     Uses TMDB search by title to fetch poster for a local title.
     If not found, returns None (never crashes the endpoint).
+    Benefits from the shared tmdb_get cache — repeated titles across
+    users/requests won't re-hit TMDB within the cache TTL.
     """
     try:
         m = await tmdb_search_first(title)
@@ -422,6 +469,8 @@ async def search_bundle(
     NOTE:
     - It selects the BEST match from TMDB for the given query.
     - If you want MULTIPLE matches, use /tmdb/search
+    - Each TF-IDF rec triggers a TMDB search for its poster; these are cached
+      via tmdb_get(), so repeated titles across requests won't re-hit TMDB.
     """
     best = await tmdb_search_first(query)
     if not best:
