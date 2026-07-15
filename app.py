@@ -1,10 +1,14 @@
+import os
 import requests
 import streamlit as st
 
 # =============================
 # CONFIG
 # =============================
-API_BASE = "https://movei-hub-02.onrender.com" or "http://127.0.0.1:8000"
+# NOTE: the old `"https://..." or "http://127.0.0.1:8000"` line always evaluated
+# to the first string (a non-empty string is always truthy), so the local URL
+# never actually got used. Using an env var with a proper fallback instead:
+API_BASE = os.getenv("API_BASE", "https://movei-hub-02.onrender.com")
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
@@ -63,7 +67,12 @@ def goto_details(tmdb_id: int):
 # =============================
 # API HELPERS
 # =============================
-@st.cache_data(ttl=30)  # short cache for autocomplete
+# TTL raised from 30s -> 300s (5 min). Home feed / trending data doesn't change
+# minute-to-minute, and every widget interaction (slider drag, category change)
+# triggers a full Streamlit rerun which re-executes this call. A longer client-side
+# cache means far fewer round-trips to the backend (which itself now caches TMDB
+# responses too — see main.py).
+@st.cache_data(ttl=300)
 def api_get_json(path: str, params: dict | None = None):
     try:
         r = requests.get(f"{API_BASE}{path}", params=params, timeout=25)
